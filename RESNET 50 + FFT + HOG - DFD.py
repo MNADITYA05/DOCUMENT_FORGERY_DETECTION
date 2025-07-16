@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision.transforms import Grayscale
 from torchvision.models import resnet50, ResNet50_Weights
@@ -35,6 +35,24 @@ def set_reproducibility(seed=42):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 set_reproducibility(seed=42)
+
+class AdaptiveDropout(nn.Module):
+    def __init__(self, base_dropout=0.1, min_dropout=0.05, max_dropout=0.3):
+        super().__init__()
+        self.base_dropout = base_dropout
+        self.min_dropout = min_dropout
+        self.max_dropout = max_dropout
+        self.current_dropout = base_dropout
+        
+    def update_dropout(self, train_acc, val_acc):
+        gap = abs(train_acc - val_acc)
+        if gap > 0.1 and train_acc > val_acc:
+            self.current_dropout = min(self.current_dropout + 0.02, self.max_dropout)
+        elif gap < 0.02 and train_acc < 0.95:
+            self.current_dropout = max(self.current_dropout - 0.01, self.min_dropout)
+        
+    def forward(self, x):
+        return F.dropout(x, p=self.current_dropout, training=self.training)
 
 class ChannelAttention(nn.Module):
     def __init__(self, channels, reduction=16):
@@ -87,20 +105,29 @@ class HOGFeatureExtractor(nn.Module):
         self.cells_per_block = (2, 2)
         self.block_norm = 'L2-Hys'
         
+        self.adaptive_dropout1 = AdaptiveDropout(0.15, 0.05, 0.25)
+        self.adaptive_dropout2 = AdaptiveDropout(0.1, 0.03, 0.2)
+        self.adaptive_dropout3 = AdaptiveDropout(0.05, 0.01, 0.15)
+        
         self.feature_processor = nn.Sequential(
             nn.Linear(34596, 2048),
             nn.BatchNorm1d(2048),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
+            self.adaptive_dropout1,
             nn.Linear(2048, 1024),
             nn.BatchNorm1d(1024),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
+            self.adaptive_dropout2,
             nn.Linear(1024, output_dim),
             nn.BatchNorm1d(output_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.1)
+            self.adaptive_dropout3
         )
+
+    def update_dropout(self, train_acc, val_acc):
+        self.adaptive_dropout1.update_dropout(train_acc, val_acc)
+        self.adaptive_dropout2.update_dropout(train_acc, val_acc)
+        self.adaptive_dropout3.update_dropout(train_acc, val_acc)
 
     def compute_hog_features(self, image_batch):
         hog_features = []
@@ -144,12 +171,17 @@ class MultiScaleFFTExtractor(nn.Module):
             )
             self.extractors.append(extractor)
         
+        self.adaptive_dropout = AdaptiveDropout(0.1, 0.02, 0.2)
+        
         self.fusion = nn.Sequential(
             nn.Linear(256 * len(self.scales), output_dim),
             nn.BatchNorm1d(output_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.2)
+            self.adaptive_dropout
         )
+
+    def update_dropout(self, train_acc, val_acc):
+        self.adaptive_dropout.update_dropout(train_acc, val_acc)
 
     def forward(self, x):
         features = []
@@ -188,12 +220,18 @@ class MultiScaleResNetFeatures(nn.Module):
         self.smooth = nn.Conv2d(256, 256, 3, padding=1)
         
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        self.adaptive_dropout = AdaptiveDropout(0.1, 0.02, 0.2)
+        
         self.projection = nn.Sequential(
             nn.Linear(256 * 4, output_dim),
             nn.BatchNorm1d(output_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.2)
+            self.adaptive_dropout
         )
+
+    def update_dropout(self, train_acc, val_acc):
+        self.adaptive_dropout.update_dropout(train_acc, val_acc)
 
     def forward(self, x):
         c1 = self.layer1(x)
@@ -225,7 +263,7 @@ class MultiScaleResNetFeatures(nn.Module):
         return self.projection(features)
 
 class TriModalAttention(nn.Module):
-    def __init__(self, d_model, nhead=8, dropout=0.1):
+    def __init__(self, d_model, nhead=8, dropout=0.05):
         super().__init__()
         self.cross_attn1 = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         self.cross_attn2 = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
@@ -236,13 +274,19 @@ class TriModalAttention(nn.Module):
         self.norm3 = nn.LayerNorm(d_model)
         self.norm4 = nn.LayerNorm(d_model)
         
-        self.dropout = nn.Dropout(dropout)
+        self.adaptive_dropout1 = AdaptiveDropout(dropout, 0.01, 0.15)
+        self.adaptive_dropout2 = AdaptiveDropout(dropout, 0.01, 0.15)
+        
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),
-            nn.Dropout(dropout),
+            self.adaptive_dropout2,
             nn.Linear(d_model * 4, d_model)
         )
+
+    def update_dropout(self, train_acc, val_acc):
+        self.adaptive_dropout1.update_dropout(train_acc, val_acc)
+        self.adaptive_dropout2.update_dropout(train_acc, val_acc)
 
     def forward(self, x1, x2, x3):
         x1_seq = x1.unsqueeze(1)
@@ -250,21 +294,21 @@ class TriModalAttention(nn.Module):
         x3_seq = x3.unsqueeze(1)
         
         cross_out1, _ = self.cross_attn1(x1_seq, x2_seq, x2_seq)
-        x1_seq = self.norm1(x1_seq + self.dropout(cross_out1))
+        x1_seq = self.norm1(x1_seq + self.adaptive_dropout1(cross_out1))
         
         cross_out2, _ = self.cross_attn2(x1_seq, x3_seq, x3_seq)
-        x1_seq = self.norm2(x1_seq + self.dropout(cross_out2))
+        x1_seq = self.norm2(x1_seq + self.adaptive_dropout1(cross_out2))
         
         self_out, _ = self.self_attn(x1_seq, x1_seq, x1_seq)
-        x1_seq = self.norm3(x1_seq + self.dropout(self_out))
+        x1_seq = self.norm3(x1_seq + self.adaptive_dropout1(self_out))
         
         ffn_out = self.ffn(x1_seq)
-        x1_seq = self.norm4(x1_seq + self.dropout(ffn_out))
+        x1_seq = self.norm4(x1_seq + ffn_out)
         
         return x1_seq.squeeze(1)
 
 class EnhancedDocumentForgeryDetector(nn.Module):
-    def __init__(self, num_classes=1, feature_dim=768, nhead=12, dropout=0.1):
+    def __init__(self, num_classes=1, feature_dim=768, nhead=12, dropout=0.05):
         super().__init__()
         
         self.visual_features = MultiScaleResNetFeatures(feature_dim)
@@ -281,18 +325,22 @@ class EnhancedDocumentForgeryDetector(nn.Module):
             nn.Sigmoid()
         )
         
+        self.adaptive_dropout1 = AdaptiveDropout(0.15, 0.05, 0.3)
+        self.adaptive_dropout2 = AdaptiveDropout(0.15, 0.05, 0.25)
+        self.adaptive_dropout3 = AdaptiveDropout(0.1, 0.02, 0.2)
+        
         self.feature_fusion = nn.Sequential(
             nn.Linear(feature_dim * 3, feature_dim),
             nn.BatchNorm1d(feature_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.3)
+            self.adaptive_dropout1
         )
         
         self.ensemble_heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(feature_dim, 256),
                 nn.ReLU(inplace=True),
-                nn.Dropout(0.3),
+                self.adaptive_dropout2,
                 nn.Linear(256, num_classes)
             ) for _ in range(3)
         ])
@@ -300,9 +348,20 @@ class EnhancedDocumentForgeryDetector(nn.Module):
         self.meta_classifier = nn.Sequential(
             nn.Linear(feature_dim + 3, 128),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
+            self.adaptive_dropout3,
             nn.Linear(128, num_classes)
         )
+
+    def update_dropout(self, train_acc, val_acc):
+        self.visual_features.update_dropout(train_acc, val_acc)
+        self.fft_features.update_dropout(train_acc, val_acc)
+        self.hog_features.update_dropout(train_acc, val_acc)
+        self.visual_fusion.update_dropout(train_acc, val_acc)
+        self.fft_fusion.update_dropout(train_acc, val_acc)
+        self.hog_fusion.update_dropout(train_acc, val_acc)
+        self.adaptive_dropout1.update_dropout(train_acc, val_acc)
+        self.adaptive_dropout2.update_dropout(train_acc, val_acc)
+        self.adaptive_dropout3.update_dropout(train_acc, val_acc)
 
     def forward(self, x):
         visual_feat = self.visual_features(x)
@@ -358,15 +417,15 @@ class FocalLoss(nn.Module):
 
 CONFIG = {
     "DATA_PATH": "/kaggle/input/rtm-dataset2/RTM",
-    "MODEL_SAVE_PATH": "enhanced_model_hog.pth",
-    "PLOT_SAVE_PATH": "enhanced_metrics_hog.png",
+    "MODEL_SAVE_PATH": "enhanced_model_adaptive.pth",
+    "PLOT_SAVE_PATH": "enhanced_metrics_adaptive.png",
     "CLASS_NAMES_PATH": "class_names.json",
     "IMAGE_SIZE": 256,
     "BATCH_SIZE": 16,
     "HEAD_ONLY_EPOCHS": 12,
     "FULL_TRAIN_EPOCHS": 70,
-    "LEARNING_RATE": 2e-4,
-    "WEIGHT_DECAY": 5e-5,
+    "LEARNING_RATE": 3e-4,
+    "WEIGHT_DECAY": 3e-5,
     "DEVICE": "cuda" if torch.cuda.is_available() else "cpu",
     "NUM_WORKERS": 4,
     "PREPROC_MEAN": [0.485, 0.456, 0.406],
@@ -391,7 +450,7 @@ def get_transforms(image_size, is_train=True):
             ], p=0.5),
             A.OneOf([
                 A.GaussianBlur(blur_limit=3, p=0.2),
-                A.GaussNoise(variance_limit=(10, 20), p=0.2),
+                A.GaussNoise(var_limit=(10, 20), p=0.2),
             ], p=0.3),
             A.CoarseDropout(max_holes=4, max_height=8, max_width=8, fill_value=0, p=0.2),
             A.Normalize(mean=mean, std=std, max_pixel_value=255.0),
@@ -604,7 +663,7 @@ def visualize_test_samples(model, test_dataloader, device, num_samples=16):
                 break
     
     plt.tight_layout()
-    plt.savefig('enhanced_test_samples_hog.png', dpi=150, bbox_inches='tight')
+    plt.savefig('enhanced_test_samples_adaptive.png', dpi=150, bbox_inches='tight')
     plt.show()
 
 def main():
@@ -641,7 +700,7 @@ def main():
         )
         print(f'-> Train Loss: {train_loss:.4f} Acc: {train_acc:.4f}')
     
-    print("\n--- STAGE 2: Fine-tuning full model ---")
+    print("\n--- STAGE 2: Adaptive fine-tuning full model ---")
     for param in model.parameters():
         param.requires_grad = True
     
@@ -653,13 +712,14 @@ def main():
         {'params': other_params, 'lr': CONFIG["LEARNING_RATE"]}
     ], weight_decay=CONFIG["WEIGHT_DECAY"])
     
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-7)
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.8, patience=5, verbose=True, min_lr=1e-7)
     
     history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
     best_val_acc = 0.0
+    best_combined_acc = 0.0
     
     for epoch in range(CONFIG["FULL_TRAIN_EPOCHS"]):
-        print(f"\nFull-Train Epoch {epoch+1}/{CONFIG['FULL_TRAIN_EPOCHS']}")
+        print(f"\nAdaptive-Train Epoch {epoch+1}/{CONFIG['FULL_TRAIN_EPOCHS']}")
         
         train_loss, train_acc = train_one_epoch(
             model, dataloaders['train'], criterion, optimizer, CONFIG['DEVICE'], 'train'
@@ -668,6 +728,8 @@ def main():
             model, dataloaders['val'], criterion, optimizer, CONFIG['DEVICE'], 'val'
         )
         
+        model.update_dropout(train_acc.item(), val_acc.item())
+        
         print(f'-> Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}')
         
         history['train_loss'].append(train_loss)
@@ -675,12 +737,24 @@ def main():
         history['val_loss'].append(val_loss)
         history['val_acc'].append(val_acc.cpu())
         
-        scheduler.step()
+        combined_metric = (train_acc + val_acc) / 2 - abs(train_acc - val_acc) * 0.5
         
-        if val_acc > best_val_acc:
+        scheduler.step(combined_metric)
+        
+        acc_gap = abs(train_acc - val_acc)
+        if acc_gap > 0.15:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] *= 0.95
+        elif acc_gap < 0.05 and train_acc < 0.95:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] *= 1.02
+                param_group['lr'] = min(param_group['lr'], CONFIG["LEARNING_RATE"])
+        
+        if combined_metric > best_combined_acc:
+            best_combined_acc = combined_metric
             best_val_acc = val_acc
             torch.save(model.state_dict(), CONFIG["MODEL_SAVE_PATH"])
-            print(f"🎉 New best model saved with Val Acc: {best_val_acc:.4f}")
+            print(f"🎉 New best model saved with Combined Score: {combined_metric:.4f}")
     
     plot_and_save_metrics(history, CONFIG['PLOT_SAVE_PATH'])
     
